@@ -9,6 +9,8 @@ This script will encode all audio tracks inside a MKV to Opus and adjust the bit
 
 8 channels (7.1) = 384 kbit/s
 
+It will also do audio normalization using "sox" with clipping-guard.
+
 It also includes a downmix - option to downmix all channels to stereo with a "Dialogue Boost Filter" based on "Robert Collier's Nightmode Dialogue" (https://superuser.com/questions/852400/properly-downmix-5-1-to-stereo-using-ffmpeg).
 
 # Requirements:
