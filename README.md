@@ -30,3 +30,12 @@ For this to work, you need the following tools in our PATH variable:
 
       Downmix mode - converts multi-channel audio to a dialogue-boosted stereo track
     .\Process-MkvAdvanced.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\downmixed.mkv" -Downmix
+
+# Batch - Mode:
+
+     foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus" + $file.Extension ; Process-MkvAdvanced.ps1 -InputFile $file -OutputFile $new }
+
+     
+# Batch - Mode down-mixing
+
+     foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus_downmixed" + $file.Extension ; Process-MkvAdvanced.ps1 -InputFile $file -OutputFile $new -Downmix }
