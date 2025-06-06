@@ -11,6 +11,8 @@ This script will encode all audio tracks inside a MKV to Opus and adjust the bit
 
 It will also do audio normalization using "sox" with clipping-guard.
 
+If the audio is already opus or AAC, it will skip the encoding and just remux it into the final file.
+
 It also includes a downmix - option to downmix all channels to stereo with a "Dialogue Boost Filter" based on "Robert Collier's Nightmode Dialogue" (https://superuser.com/questions/852400/properly-downmix-5-1-to-stereo-using-ffmpeg).
 
 # Requirements:
