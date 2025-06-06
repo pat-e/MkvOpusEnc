@@ -19,11 +19,11 @@
 
 .EXAMPLE
     # Regular mode - preserves channel layouts
-    .\Process-MkvAdvanced.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\regular.mkv"
+    .\MkvOpusEnc.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\regular.mkv"
 
 .EXAMPLE
     # Downmix mode - converts multi-channel audio to a dialogue-boosted stereo track
-    .\Process-MkvAdvanced.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\downmixed.mkv" -Downmix
+    .\MkvOpusEnc.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\downmixed.mkv" -Downmix
 #>
 
 # This makes the script behave like a compiled cmdlet with proper parameter handling.
@@ -38,7 +38,7 @@ param (
 # Manual check for parameters.
 if ([string]::IsNullOrWhiteSpace($InputFile) -or [string]::IsNullOrWhiteSpace($OutputFile)) {
     Write-Host "Usage Example:" -ForegroundColor Yellow
-    Write-Host '  .\Process-MkvAdvanced.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\movie.mkv"'
+    Write-Host '  .\MkvOpusEnc.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\movie.mkv"'
     Write-Host '  (Add -Downmix switch to downmix multi-channel audio to stereo)'
     return
 }
