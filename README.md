@@ -1,4 +1,4 @@
-# Process-MkvAdvanced
+# MkvOpusEnc
 MKV Audio to Opus with Downmix-Option in Powershell
 
 This script will encode all audio tracks inside a MKV to Opus and adjust the bitrate based on the channel layout:
@@ -28,16 +28,16 @@ For this to work, you need the following tools in our PATH variable:
 # Usage:
 
      Regular mode - preserves channel layouts
-    .\Process-MkvAdvanced.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\regular.mkv"
+    .\MkvOpusEnc.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\regular.mkv"
 
       Downmix mode - converts multi-channel audio to a dialogue-boosted stereo track
-    .\Process-MkvAdvanced.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\downmixed.mkv" -Downmix
+    .\MkvOpusEnc.ps1 -InputFile "C:\path\to\movie.mkv" -OutputFile "C:\path\to\downmixed.mkv" -Downmix
 
 # Batch - Mode:
 
-     foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus" + $file.Extension ; Process-MkvAdvanced.ps1 -InputFile $file -OutputFile $new }
+     foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus" + $file.Extension ; MkvOpusEnc.ps1 -InputFile $file -OutputFile $new }
 
      
 # Batch - Mode down-mixing
 
-     foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus_downmixed" + $file.Extension ; Process-MkvAdvanced.ps1 -InputFile $file -OutputFile $new -Downmix }
+     foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus_downmixed" + $file.Extension ; MkvOpusEnc.ps1 -InputFile $file -OutputFile $new -Downmix }
