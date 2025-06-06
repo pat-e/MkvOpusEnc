@@ -84,9 +84,3 @@ This command will re-encode a 5.1 DTS track into a **stereo** Opus track using t
 ```powershell
 ./MkvOpusEnc.ps1 -InputFile "C:\Movies\MyMovie.mkv" -OutputFile "C:\Movies\MyMovie-Stereo.mkv" -Downmix
 ```
-
----
-
-## License
-
-This project is licensed under the MIT License. To formally apply this, create a file named `LICENSE` in the root of the repository and paste the full text of the MIT License into it.
