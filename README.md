@@ -84,3 +84,11 @@ This command will re-encode a 5.1 DTS track into a **stereo** Opus track using t
 ```powershell
 ./MkvOpusEnc.ps1 -InputFile "C:\Movies\MyMovie.mkv" -OutputFile "C:\Movies\MyMovie-Stereo.mkv" -Downmix
 ```
+
+#### Example 3: Batch Mode
+
+This command will re-encode multiple files to Opus.
+
+```powershell
+foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus" + $file.Extension ; MkvOpusEnc.ps1 -InputFile $file -OutputFile $new }
+```
