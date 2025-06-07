@@ -117,9 +117,9 @@ try {
     # 3. --- Get Media Information ---
     Write-Host "Analyzing file: $InputFile"
     $ffprobeInfoJson = ffprobe -v quiet -print_format json -show_streams -show_format "$InputFile"
-    $ffprobeInfo = $ffprobeInfoJson | ConvertFrom-Json
+    $ffprobeInfo = $ffprobeInfoJson | ConvertFrom-Json -AsHashtable
     
-    $mkvInfo = (mkvmerge -J "$InputFile") | ConvertFrom-Json -AsHashtable
+    $mkvInfo = (mkvmerge -J "$InputFile") | ConvertFrom-Json
     
     $mediaInfoJson = (mediainfo --Output=JSON -f "$InputFile") | ConvertFrom-Json
 
