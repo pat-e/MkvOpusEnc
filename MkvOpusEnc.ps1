@@ -119,7 +119,7 @@ try {
     $ffprobeInfoJson = ffprobe -v quiet -print_format json -show_streams -show_format "$InputFile"
     $ffprobeInfo = $ffprobeInfoJson | ConvertFrom-Json
     
-    $mkvInfo = (mkvmerge -J "$InputFile") | ConvertFrom-Json
+    $mkvInfo = (mkvmerge -J "$InputFile") | ConvertFrom-Json -AsHashtable
     
     $mediaInfoJson = (mediainfo --Output=JSON -f "$InputFile") | ConvertFrom-Json
 
