@@ -1,233 +1,379 @@
 <#
 .SYNOPSIS
-    Processes or downmixes an MKV file's audio tracks sequentially using a specific toolchain.
-    This script is cross-platform and optimized for correctness and clean output.
+    Batch-processes MKV files in the current directory and converts non-AAC/Opus audio tracks to Opus.
 
 .DESCRIPTION
-    This script intelligently handles audio streams in an MKV file one by one.
-    - AAC/Opus audio is remuxed.
-    - Multi-channel audio (DTS, AC3, etc.) can be re-encoded or optionally downmixed to stereo.
-    - All other streams and metadata (title, language, delay) are preserved.
-
-.PARAMETER InputFile
-    The full path to the source MKV file.
-
-.PARAMETER OutputFile
-    The full path for the processed output MKV file.
-
-.PARAMETER Downmix
-    An optional switch. If present, multi-channel audio will be downmixed to stereo.
-
-.EXAMPLE
-    # Regular mode - preserves channel layouts
-    ./MkvOpusEnc.ps1 -InputFile "C:\Movies\My Movie (2025) [1080p].mkv" -OutputFile "C:\Movies\regular.mkv"
-
-.EXAMPLE
-    # Downmix mode
-    ./MkvOpusEnc.ps1 -InputFile "C:\Movies\My Movie (2025) [1080p].mkv" -OutputFile "C:\Movies\downmixed.mkv" -Downmix
+    Mirrors the behavior of MkvOpusEnc.py:
+    - Scans for *.mkv files (excluding temp-output-*).
+    - AAC/Opus tracks are remuxed unchanged.
+    - All other audio codecs are extracted, normalized, and encoded to Opus.
+    - Optional downmix for 5.1/7.1 and other 6+ channel layouts.
+    - Preserves language, title, and delay metadata for re-encoded tracks.
+    - Writes per-file logs to conv_logs, moves processed files to completed, originals to original.
 #>
 
-# This makes the script behave like a compiled cmdlet with proper parameter handling.
 [CmdletBinding()]
-# The param block is now at the top level of the script.
 param (
-    [string]$InputFile,
-    [string]$OutputFile,
     [switch]$Downmix
 )
 
-# Sanitize input path to remove PowerShell's escape characters (`).
-if ($PSBoundParameters.ContainsKey('InputFile')) {
-    $InputFile = $InputFile -replace '`',''
-}
-if ($PSBoundParameters.ContainsKey('OutputFile')) {
-    $OutputFile = $OutputFile -replace '`',''
-}
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-
-# Manual check for parameters.
-if ([string]::IsNullOrWhiteSpace($InputFile) -or [string]::IsNullOrWhiteSpace($OutputFile)) {
-    Write-Host "Usage Example:" -ForegroundColor Yellow
-    Write-Host "  ./MkvOpusEnc.ps1 -InputFile `"C:\path\to\movie.mkv`" -OutputFile `"C:\path\to\movie.mkv`""
-    Write-Host '  (Add -Downmix switch to downmix multi-channel audio to stereo)'
-    return
-}
-
-# 1. --- Prerequisite Check ---
-$requiredTools = "ffmpeg", "ffprobe", "mkvmerge", "sox", "opusenc", "mediainfo"
-foreach ($tool in $requiredTools) {
-    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-        Write-Error "Required tool '$tool' not found. Please install it and ensure it's in your system's PATH."
-        return
-    }
-}
-
-# --- MODIFIED: Use -LiteralPath to prevent PowerShell from interpreting [ and ] as wildcards.
-if (-not (Test-Path -LiteralPath $InputFile)) {
-    Write-Error "Input file not found: $InputFile"
-    return
-}
-
-# Helper function is defined in the script scope.
-function Convert-AudioTrack($index, $ch, $lang, $tempDirFullName, $sourceFile, [bool]$shouldDownmix) {
-    $tempExtracted = Join-Path $tempDirFullName "track_${index}_extracted.flac"
-    $tempNormalized = Join-Path $tempDirFullName "track_${index}_normalized.flac"
-    $finalOpus = Join-Path $tempDirFullName "track_${index}_final.opus"
-
-    # Step 1: Extract audio, with conditional downmixing
-    Write-Host "    - Extracting to FLAC..."
-    $ffmpegArgs = @("-v", "quiet", "-stats", "-i", $sourceFile, "-map", "0:$($index)")
-    if ($shouldDownmix -and $ch -ge 6) {
-        if ($ch -eq 6) { # 5.1 Channels
-            Write-Host "      (Downmixing 5.1 to Stereo with dialogue boost)"
-            $ffmpegArgs += "-af", "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5"
-        }
-        elseif ($ch -eq 8) { # 7.1 Channels
-            Write-Host "      (Downmixing 7.1 to Stereo with dialogue boost)"
-            $ffmpegArgs += "-af", "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7"
-        }
-        else { # Other multi-channel layouts
-             Write-Host "      ($($ch)-channel source, downmixing to stereo using default -ac 2)"
-             $ffmpegArgs += "-ac", "2"
-        }
-    } else {
-        Write-Host "      (Preserving $($ch)-channel layout)"
-    }
-    $ffmpegArgs += "-c:a", "flac", $tempExtracted
-    & ffmpeg $ffmpegArgs
-    
-    # Step 2: Normalize the track with SoX
-    Write-Host "    - Normalizing with SoX..."
-    & sox $tempExtracted $tempNormalized -S --temp $tempDirFullName --guard gain -n
-    
-    # Step 3: Encode to Opus with the correct bitrate
-    $bitrate = "192k" # A fallback bitrate
-    if ($shouldDownmix) {
-        $bitrate = "128k"
-    } else {
-        switch ($ch) {
-            2 { $bitrate = "128k" }
-            6 { $bitrate = "256k" }
-            8 { $bitrate = "384k" }
-        }
-    }
-    Write-Host "    - Encoding to Opus at $bitrate..."
-    & opusenc --vbr --bitrate $bitrate $tempNormalized $finalOpus
-
-    return $finalOpus
-}
-
-# 2. --- Setup Temporary Environment ---
-$tempDir = New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString()))
-Write-Host "Temporary directory created at: $($tempDir.FullName)"
-
-try {
-    # 3. --- Get Media Information using robust argument handling ---
-    Write-Host "Analyzing file: $InputFile"
-
-    $ffprobeArgs = @("-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", $InputFile)
-    $ffprobeInfoJson = & ffprobe $ffprobeArgs
-    $ffprobeInfo = $ffprobeInfoJson | ConvertFrom-Json -AsHashtable
-    
-    $mkvmergeJsonArgs = @("-J", $InputFile)
-    $mkvInfoJson = & mkvmerge $mkvmergeJsonArgs
-    $mkvInfo = $mkvInfoJson | ConvertFrom-Json
-    
-    $mediainfoArgs = @("--Output=JSON", "-f", $InputFile)
-    $mediaInfoJsonString = & mediainfo $mediainfoArgs
-    $mediaInfoJson = $mediaInfoJsonString | ConvertFrom-Json
-
-    # 4. --- Prepare for Final mkvmerge Command ---
-    $processedAudioFiles = [System.Collections.ArrayList]@()
-    $audioTracksToRemux = [System.Collections.ArrayList]@()
-    
-    $videoTIDs = ($mkvInfo.tracks | Where-Object { $_.type -eq 'video' }).id
-    $subtitleTIDs = ($mkvInfo.tracks | Where-Object { $_.type -eq 'subtitles' }).id
-    $attachmentTIDs = ($mkvInfo.tracks | Where-Object { $_.type -eq 'attachments' }).id
-
-    # 5. --- Process Each Audio Stream ---
-    $audioStreams = $ffprobeInfo.streams | Where-Object { $_.codec_type -eq 'audio' }
-    
-    foreach ($stream in $audioStreams) {
-        $streamIndex = $stream.index
-        $codec = $stream.codec_name
-        $channels = $stream.channels
-        $language = if ($stream.tags.language) { $stream.tags.language } else { "und" }
-        
-        $mkvTrack = $mkvInfo.tracks[$streamIndex]
-        $trackID = $mkvTrack.id
-        $trackTitle = $mkvTrack.properties.track_name
-        
-        $trackDelay = 0
-        $mediaInfoTrack = $mediaInfoJson.media.track | Where-Object { $_.'@type' -eq 'Audio' -and $_.StreamOrder -eq $streamIndex }
-        $delayInSeconds = $mediaInfoTrack.Video_Delay
-        
-        if ($null -ne $delayInSeconds) {
-            $trackDelay = [math]::Round( ([double]$delayInSeconds) * 1000 )
-        }
-
-        Write-Host "Processing Audio Stream #${streamIndex} (TID: $trackID, Title: $trackTitle, Delay: $($trackDelay)ms, Lang: $language, Codec: $codec, Channels: $channels)"
-
-        switch ($codec) {
-            'aac' { Write-Host "  -> Action: Remuxing."; $null = $audioTracksToRemux.Add($trackID) }
-            'opus' { Write-Host "  -> Action: Remuxing."; $null = $audioTracksToRemux.Add($trackID) }
-            { @('dts', 'ac3', 'eac3', 'flac') -contains $_ } {
-                Write-Host "  -> Action: Re-encoding."
-                $opusFile = Convert-AudioTrack $streamIndex $channels $language $tempDir.FullName $InputFile $Downmix.IsPresent
-                $null = $processedAudioFiles.Add(@{ Path = $opusFile; Language = $language; Title = $trackTitle; Delay = $trackDelay })
-            }
-            default {
-                Write-Warning "  -> Action: Unsupported codec '$codec'. Remuxing as fallback."
-                $null = $audioTracksToRemux.Add($trackID)
-            }
-        }
-    }
-
-    # 6. --- Construct and Execute Final mkvmerge Command using Best Practices ---
-    Write-Host "`nAssembling final mkvmerge command..."
-    $mkvmergeArgs = @(
-        "-o",
-        $OutputFile
+function Invoke-ExternalCommand {
+    param (
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [switch]$CaptureOutput,
+        [switch]$NoCheck
     )
 
-    if ($videoTIDs.Count -gt 0) { $mkvmergeArgs += "-d", ($videoTIDs -join ',') }
-    if ($subtitleTIDs.Count -gt 0) { $mkvmergeArgs += "-s", ($subtitleTIDs -join ',') }
-    if ($attachmentTIDs.Count -gt 0) { $mkvmergeArgs += "-t", ($attachmentTIDs -join ',') }
-    
-    if ($audioStreams.Count -gt 0) { 
-        if ($audioTracksToRemux.Count -gt 0) {
-            $mkvmergeArgs += "-a", ($audioTracksToRemux -join ',')
-        } else {
-            $mkvmergeArgs += "--no-audio"
+    if ($CaptureOutput) {
+        $output = & $Command @Arguments
+        $exitCode = $LASTEXITCODE
+        if (-not $NoCheck -and $exitCode -ne 0) {
+            throw "Command failed (exit code $exitCode): $Command $($Arguments -join ' ')"
         }
-    }
-    
-    $mkvmergeArgs += $InputFile
-
-    foreach ($fileInfo in $processedAudioFiles) {
-        $mkvmergeArgs += "--language", "0:$($fileInfo.Language)"
-        $mkvmergeArgs += "--track-name", "0:$($fileInfo.Title)"
-
-        if ($null -ne $fileInfo.Delay -and $fileInfo.Delay -ne 0) {
-            $mkvmergeArgs += "--sync", "0:$($fileInfo.Delay)"
-        }
-
-        $mkvmergeArgs += $fileInfo.Path
+        return ($output -join [Environment]::NewLine)
     }
 
-    Write-Host "`nExecuting command:"
-    Write-Host ("mkvmerge " + ($mkvmergeArgs | ForEach-Object { if ($_ -match '\s|\[|\]|\(|\)') { "`"$_`"" } else { $_ } }) -join " ")
-    
-    & mkvmerge $mkvmergeArgs
+    & $Command @Arguments
+    $exitCode = $LASTEXITCODE
+    if (-not $NoCheck -and $exitCode -ne 0) {
+        throw "Command failed (exit code $exitCode): $Command $($Arguments -join ' ')"
+    }
+
+    return $null
 }
-catch {
-    Write-Error "An error occurred during processing: $($_.Exception.Message)"
+
+function Test-RequiredTools {
+    $requiredTools = @('ffmpeg', 'ffprobe', 'mkvmerge', 'sox_ng', 'opusenc', 'mediainfo')
+    Write-Host '--- Prerequisite Check ---'
+
+    $allFound = $true
+    foreach ($tool in $requiredTools) {
+        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+            Write-Error "Required tool '$tool' not found."
+            $allFound = $false
+        }
+    }
+
+    if (-not $allFound) {
+        throw "Please install the missing tools and ensure they are in your system's PATH."
+    }
+
+    Write-Host 'All required tools found.'
 }
-finally {
-    # 7. --- Cleanup ---
-    Write-Host "`nCleaning up temporary files..."
-    if ($tempDir -and (Test-Path -LiteralPath $tempDir.FullName)) {
-        # Using -LiteralPath here too for maximum robustness
-        Remove-Item -Recurse -Force -LiteralPath $tempDir.FullName
+
+function Convert-AudioTrack {
+    param (
+        [Parameter(Mandatory = $true)][int]$StreamIndex,
+        [Parameter(Mandatory = $true)][int]$Channels,
+        [Parameter(Mandatory = $true)][string]$TempDir,
+        [Parameter(Mandatory = $true)][string]$SourceFile,
+        [Parameter(Mandatory = $true)][bool]$ShouldDownmix,
+        [Parameter(Mandatory = $true)][string]$BitrateInfo
+    )
+
+    $tempExtracted = Join-Path $TempDir "track_${StreamIndex}_extracted.flac"
+    $tempNormalized = Join-Path $TempDir "track_${StreamIndex}_normalized.flac"
+    $finalOpus = Join-Path $TempDir "track_${StreamIndex}_final.opus"
+
+    Write-Host '    - Extracting to FLAC...'
+    $ffmpegArgs = @('-v', 'quiet', '-stats', '-y', '-i', $SourceFile, '-map', "0:$StreamIndex")
+
+    $finalChannels = $Channels
+    if ($ShouldDownmix -and $Channels -ge 6) {
+        if ($Channels -eq 6) {
+            Write-Host '      (Downmixing 5.1 to Stereo with dialogue boost)'
+            $ffmpegArgs += @('-af', 'pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5')
+            $finalChannels = 2
+        }
+        elseif ($Channels -eq 8) {
+            Write-Host '      (Downmixing 7.1 to Stereo with dialogue boost)'
+            $ffmpegArgs += @('-af', 'pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7')
+            $finalChannels = 2
+        }
+        else {
+            Write-Host "      ($Channels-channel source, downmixing to stereo using default -ac 2)"
+            $ffmpegArgs += @('-ac', '2')
+            $finalChannels = 2
+        }
+    }
+    else {
+        Write-Host "      (Preserving $Channels-channel layout)"
+    }
+
+    $ffmpegArgs += @('-c:a', 'flac', $tempExtracted)
+    Invoke-ExternalCommand -Command 'ffmpeg' -Arguments $ffmpegArgs | Out-Null
+
+    Write-Host '    - Normalizing with SoX...'
+    Invoke-ExternalCommand -Command 'sox_ng' -Arguments @($tempExtracted, $tempNormalized, '-S', '--temp', $TempDir, '--guard', 'gain', '-n') | Out-Null
+
+    $bitrate = '192k'
+    if ($finalChannels -eq 1) {
+        $bitrate = '64k'
+    }
+    elseif ($finalChannels -eq 2) {
+        $bitrate = '128k'
+    }
+    elseif ($finalChannels -eq 6) {
+        $bitrate = '256k'
+    }
+    elseif ($finalChannels -eq 8) {
+        $bitrate = '384k'
+    }
+
+    Write-Host "    - Encoding to Opus at $bitrate..."
+    Write-Host "      Source: $BitrateInfo -> Destination: Opus $bitrate ($finalChannels channels)"
+    Invoke-ExternalCommand -Command 'opusenc' -Arguments @('--vbr', '--bitrate', $bitrate, $tempNormalized, $finalOpus) | Out-Null
+
+    return @{
+        Path = $finalOpus
+        FinalChannels = $finalChannels
+        Bitrate = $bitrate
+    }
+}
+
+Test-RequiredTools
+
+$DIR_COMPLETED = Join-Path (Get-Location) 'completed'
+$DIR_ORIGINAL = Join-Path (Get-Location) 'original'
+$DIR_LOGS = Join-Path (Get-Location) 'conv_logs'
+
+$filesToProcess = Get-ChildItem -File -Filter '*.mkv' |
+    Where-Object { $_.Name -notlike 'temp-output-*' } |
+    Sort-Object Name
+
+if (-not $filesToProcess) {
+    Write-Host 'No MKV files found to process. Exiting.'
+    return
+}
+
+$null = New-Item -ItemType Directory -Path $DIR_COMPLETED -Force
+$null = New-Item -ItemType Directory -Path $DIR_ORIGINAL -Force
+$null = New-Item -ItemType Directory -Path $DIR_LOGS -Force
+
+foreach ($file in $filesToProcess) {
+    $logFilePath = Join-Path $DIR_LOGS "$($file.Name).log"
+    $intermediateOutputFile = Join-Path (Get-Location) "temp-output-$($file.Name)"
+    $tempDir = $null
+
+    Start-Transcript -Path $logFilePath -Force | Out-Null
+    try {
+        Write-Host ('-' * 80)
+        Write-Host "Starting processing for: $($file.Name)"
+        Write-Host "Log file: $logFilePath"
+        $startTime = Get-Date
+
+        $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mkvopusenc_{0}" -f ([System.Guid]::NewGuid().ToString('N')))
+        $null = New-Item -ItemType Directory -Path $tempDir -Force
+        Write-Host "Temporary directory for audio created at: $tempDir"
+
+        Write-Host "Analyzing file: $($file.FullName)"
+        $ffprobeInfoJson = Invoke-ExternalCommand -Command 'ffprobe' -Arguments @('-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', $file.FullName) -CaptureOutput
+        $ffprobeInfo = $ffprobeInfoJson | ConvertFrom-Json -AsHashtable
+
+        $mkvmergeInfoJson = Invoke-ExternalCommand -Command 'mkvmerge' -Arguments @('-J', $file.FullName) -CaptureOutput
+        $mkvInfo = $mkvmergeInfoJson | ConvertFrom-Json -AsHashtable
+
+        $mediainfoJson = Invoke-ExternalCommand -Command 'mediainfo' -Arguments @('--Output=JSON', '-f', $file.FullName) -CaptureOutput
+        $mediaInfo = $mediainfoJson | ConvertFrom-Json -AsHashtable
+
+        $processedAudioFiles = [System.Collections.ArrayList]@()
+        $tidsOfReencodedTracks = [System.Collections.ArrayList]@()
+
+        $audioStreams = @($ffprobeInfo.streams | Where-Object { $_.codec_type -eq 'audio' })
+        if ($audioStreams.Count -eq 0) {
+            Write-Warning "No audio streams found in '$($file.Name)'. Skipping file."
+            continue
+        }
+
+        $mkvTracksList = @($mkvInfo.tracks)
+        $mkvAudioTracks = @($mkvTracksList | Where-Object { $_.type -eq 'audio' })
+
+        $mediaTracksData = @($mediaInfo.media.track)
+        $mediainfoAudioTracks = @{}
+        foreach ($track in $mediaTracksData) {
+            if ($track.'@type' -ne 'Audio') {
+                continue
+            }
+
+            $streamOrder = -1
+            if ($null -ne $track.StreamOrder) {
+                $parsed = 0
+                if ([int]::TryParse([string]$track.StreamOrder, [ref]$parsed)) {
+                    $streamOrder = $parsed
+                }
+            }
+
+            $mediainfoAudioTracks[$streamOrder] = $track
+        }
+
+        Write-Host "`n=== Audio Track Analysis ==="
+        for ($audioStreamIdx = 0; $audioStreamIdx -lt $audioStreams.Count; $audioStreamIdx++) {
+            $stream = $audioStreams[$audioStreamIdx]
+            $streamIndex = [int]$stream.index
+            $codec = [string]$stream.codec_name
+            $channels = 2
+            if ($null -ne $stream.channels) {
+                $channels = [int]$stream.channels
+            }
+
+            $language = 'und'
+            if ($stream.ContainsKey('tags') -and $null -ne $stream.tags -and $stream.tags.ContainsKey('language')) {
+                $language = [string]$stream.tags.language
+            }
+
+            $trackId = -1
+            $mkvTrack = @{}
+            if ($audioStreamIdx -lt $mkvAudioTracks.Count) {
+                $mkvTrack = $mkvAudioTracks[$audioStreamIdx]
+                if ($mkvTrack.ContainsKey('id')) {
+                    $trackId = [int]$mkvTrack.id
+                }
+            }
+
+            if ($trackId -eq -1) {
+                Write-Warning "Could not map ffprobe audio stream index $streamIndex to an mkvmerge track ID. Skipping this track."
+                continue
+            }
+
+            $trackTitle = ''
+            if ($mkvTrack.ContainsKey('properties') -and $null -ne $mkvTrack.properties -and $mkvTrack.properties.ContainsKey('track_name')) {
+                $trackTitle = [string]$mkvTrack.properties.track_name
+            }
+
+            $trackDelay = 0
+            $audioTrackInfo = $null
+            if ($mediainfoAudioTracks.ContainsKey($streamIndex)) {
+                $audioTrackInfo = $mediainfoAudioTracks[$streamIndex]
+            }
+
+            $bitrate = 'Unknown'
+            if ($null -ne $audioTrackInfo) {
+                if ($audioTrackInfo.ContainsKey('BitRate')) {
+                    $brValue = 0
+                    if ([int]::TryParse([string]$audioTrackInfo.BitRate, [ref]$brValue)) {
+                        $bitrate = "{0}k" -f [int]($brValue / 1000)
+                    }
+                }
+                elseif ($audioTrackInfo.ContainsKey('BitRate_Nominal')) {
+                    $brValue = 0
+                    if ([int]::TryParse([string]$audioTrackInfo.BitRate_Nominal, [ref]$brValue)) {
+                        $bitrate = "{0}k" -f [int]($brValue / 1000)
+                    }
+                }
+
+                if ($audioTrackInfo.ContainsKey('Video_Delay')) {
+                    $delayRaw = $audioTrackInfo.Video_Delay
+                    if ($null -ne $delayRaw) {
+                        $delayVal = 0.0
+                        if ([double]::TryParse([string]$delayRaw, [ref]$delayVal)) {
+                            if ($delayVal -lt 1 -and $delayVal -gt -1) {
+                                $trackDelay = [int][math]::Round($delayVal * 1000)
+                            }
+                            else {
+                                $trackDelay = [int][math]::Round($delayVal)
+                            }
+                        }
+                    }
+                }
+            }
+
+            $trackInfo = "Audio Stream #$streamIndex (TID: $trackId, Codec: $codec, Bitrate: $bitrate, Channels: $channels)"
+            if (-not [string]::IsNullOrWhiteSpace($trackTitle)) {
+                $trackInfo += ", Title: '$trackTitle'"
+            }
+            if ($language -ne 'und') {
+                $trackInfo += ", Language: $language"
+            }
+            if ($trackDelay -ne 0) {
+                $trackInfo += ", Delay: ${trackDelay}ms"
+            }
+
+            Write-Host "`nProcessing $trackInfo"
+
+            if ($codec -in @('aac', 'opus')) {
+                Write-Host "  -> Action: Remuxing track (keeping original $($codec.ToUpperInvariant()) $bitrate)"
+            }
+            else {
+                $bitrateInfo = "$($codec.ToUpperInvariant()) $bitrate"
+                Write-Host "  -> Action: Re-encoding codec '$codec' to Opus"
+                $converted = Convert-AudioTrack -StreamIndex $streamIndex -Channels $channels -TempDir $tempDir -SourceFile $file.FullName -ShouldDownmix $Downmix.IsPresent -BitrateInfo $bitrateInfo
+
+                $null = $processedAudioFiles.Add(@{
+                    Path = $converted.Path
+                    Language = $language
+                    Title = $trackTitle
+                    Delay = $trackDelay
+                })
+                $null = $tidsOfReencodedTracks.Add([string]$trackId)
+            }
+        }
+
+        Write-Host "`n=== Final MKV Creation ==="
+        Write-Host 'Assembling final mkvmerge command...'
+        $mkvmergeArgs = @('-o', $intermediateOutputFile)
+
+        if ($processedAudioFiles.Count -eq 0) {
+            Write-Host '  -> All audio tracks are in the desired format. Performing a full remux.'
+            $mkvmergeArgs += $file.FullName
+        }
+        else {
+            $mkvmergeArgs += @('--audio-tracks', '!' + ($tidsOfReencodedTracks -join ','))
+            $mkvmergeArgs += $file.FullName
+
+            foreach ($fileInfo in $processedAudioFiles) {
+                $mkvmergeArgs += @('--language', "0:$($fileInfo.Language)")
+                if (-not [string]::IsNullOrWhiteSpace([string]$fileInfo.Title)) {
+                    $mkvmergeArgs += @('--track-name', "0:$($fileInfo.Title)")
+                }
+                if ([int]$fileInfo.Delay -ne 0) {
+                    $mkvmergeArgs += @('--sync', "0:$($fileInfo.Delay)")
+                }
+                $mkvmergeArgs += [string]$fileInfo.Path
+            }
+        }
+
+        Write-Host 'Executing mkvmerge...'
+        Invoke-ExternalCommand -Command 'mkvmerge' -Arguments $mkvmergeArgs | Out-Null
+        Write-Host 'MKV creation complete'
+
+        Write-Host "`n=== File Management ==="
+        $completedTarget = Join-Path $DIR_COMPLETED $file.Name
+        $originalTarget = Join-Path $DIR_ORIGINAL $file.Name
+
+        Write-Host "Moving processed file to: $completedTarget"
+        Move-Item -LiteralPath $intermediateOutputFile -Destination $completedTarget -Force
+
+        Write-Host "Moving original file to: $originalTarget"
+        Move-Item -LiteralPath $file.FullName -Destination $originalTarget -Force
+
+        $runtime = (Get-Date) - $startTime
+        $hours = [int][math]::Floor($runtime.TotalHours)
+        $runtimeStr = '{0:00}:{1:00}:{2:00}' -f $hours, $runtime.Minutes, $runtime.Seconds
+        Write-Host "`nTotal processing time: $runtimeStr"
+    }
+    catch {
+        Write-Error "An error occurred while processing '$($file.Name)': $($_.Exception.Message)"
+        if (Test-Path -LiteralPath $intermediateOutputFile) {
+            Remove-Item -LiteralPath $intermediateOutputFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    finally {
+        Write-Host "`n=== Cleanup ==="
+        Write-Host 'Cleaning up temporary files...'
+        if ($null -ne $tempDir -and (Test-Path -LiteralPath $tempDir)) {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host 'Temporary directory removed.'
+        }
+
+        try {
+            Stop-Transcript | Out-Null
+        }
+        catch {
+            # Ignore transcript stop failures to preserve main flow.
+        }
     }
 }
