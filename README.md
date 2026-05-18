@@ -45,6 +45,18 @@ For [MkvOpusEnc.ps1](MkvOpusEnc.ps1), install PowerShell 7+ plus the same extern
 
 Install the media tools using your package manager, then verify they are on `PATH`.
 
+### Post-Install Check (PATH Validation)
+
+Run the following commands to confirm each required tool is available:
+
+```powershell
+ffmpeg -version
+mkvmerge --version
+sox_ng --version
+opusenc --version
+mediainfo --Version
+```
+
 ### Windows (winget)
 
 ```powershell
