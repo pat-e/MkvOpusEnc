@@ -1,94 +1,102 @@
 # MkvOpusEnc
 
-A powerful PowerShell script for advanced audio track processing in MKV files. This script intelligently re-encodes or remuxes audio tracks based on their codec, while preserving all video, subtitle, attachment, and metadata information.
+MkvOpusEnc is a batch MKV audio processing toolchain with **Python as the primary implementation**.
 
-It includes a flexible downmixing feature to convert multi-channel surround sound into a dialogue-focused stereo track, perfect for "night mode" listening or playback on stereo devices.
+The main script is [MkvOpusEnc.py](MkvOpusEnc.py). It scans the current folder for `.mkv` files, re-encodes non-AAC/Opus audio to Opus, preserves metadata, and organizes outputs automatically.
 
-## Key Features
+The PowerShell script [MkvOpusEnc.ps1](MkvOpusEnc.ps1) is a **legacy compatibility version** for Windows users who do not have Python installed.
 
-- **Selective Re-encoding:** Automatically re-encodes common high-bitrate codecs like DTS, AC3, E-AC3, and FLAC into the efficient Opus format.
-- **Lossless Remuxing:** Preserves audio quality by remuxing (copying) tracks that are already in a modern format like AAC or Opus.
-- **Full Metadata Preservation:** Carefully reads and re-applies all critical metadata, ensuring nothing is lost:
-    - **Video, Subtitle, and Font Attachments** are all carried over.
-    - **Audio Track Titles** (e.g., "Commentary by Director") are preserved.
-    - **Audio Track Language** tags are preserved.
-    - **Audio Delay (A/V Sync)** is read accurately and re-applied to maintain perfect synchronization.
-- **Optional Downmixing:** A `-Downmix` switch transforms the script's behavior:
-    - **Standard Mode:** Preserves the original channel layout (e.g., 5.1 DTS becomes 5.1 Opus).
-    - **Downmix Mode:** Converts 5.1 or 7.1 surround sound into a high-quality stereo track.
-- **High-Quality Downmix Formulas:** Uses specific, fine-tuned `ffmpeg` `pan` filters for downmixing, including a "dialogue boost" formula for clear speech.
-- **Cross-Platform:** Fully compatible with PowerShell 7 on **Windows** and **Linux**.
-- **Clean Operation:** Creates and automatically cleans up a temporary directory for all intermediate files.
+## Project Status
+
+- Primary script: [MkvOpusEnc.py](MkvOpusEnc.py)
+- Legacy fallback: [MkvOpusEnc.ps1](MkvOpusEnc.ps1)
+
+If both are available in your environment, use the Python script.
+
+## What The Python Script Does
+
+- Processes all `.mkv` files in the current directory (except files starting with `temp-output-`).
+- Keeps `aac` and `opus` audio tracks as-is (remux).
+- Re-encodes other audio codecs to Opus.
+- Preserves language, track title, and delay for re-encoded tracks.
+- Supports optional downmix to stereo for 6+ channel tracks.
+- Writes one log file per input to `conv_logs`.
+- Moves processed outputs to `completed` and originals to `original`.
 
 ## Requirements
 
-1.  **PowerShell 7+** (for cross-platform compatibility)
-2.  **FFmpeg**: For audio extraction and downmixing.
-3.  **MKVToolNix**: For reading container data and final muxing (`mkvmerge`).
-4.  **SoX (Sound eXchange)**: For audio normalization.
-5.  **opus-tools**: For Opus encoding (`opusenc`).
-6.  **MediaInfo**: For accurate audio delay detection.
+### Primary (Python)
 
-## Installation
+1. Python 3.8+
+2. ffmpeg
+3. ffprobe
+4. mkvmerge (MKVToolNix)
+5. sox_ng
+6. opusenc (opus-tools)
+7. mediainfo
 
-First, ensure you have PowerShell 7 or newer installed. Then, install the required command-line tools. They must be available in your system's `PATH`.
+All tools must be available in your `PATH`.
 
-#### Windows (using [Chocolatey](https://chocolatey.org/))
+### Legacy (PowerShell)
+
+For [MkvOpusEnc.ps1](MkvOpusEnc.ps1), install PowerShell 7+ plus the same external tools above.
+
+## Installation Notes
+
+Install the media tools using your package manager, then verify they are on `PATH`.
+
+### Windows (winget)
+
 ```powershell
-choco install ffmpeg mkvtoolnix sox opus-tools mediainfo
+winget install Gyan.FFmpeg MoritzBunkus.MKVToolNix sox_ng.sox_ng MediaArea.MediaInfo
 ```
 
-#### Linux (Debian / Ubuntu)
+For Opus tools (`opusenc`), install from:
+
+- https://github.com/Chocobo1/opus-tools_win32-build
+
+### Linux (Debian / Ubuntu example)
+
 ```bash
 sudo apt-get update
-sudo apt-get install ffmpeg mkvtoolnix sox opus-tools mediainfo
+sudo apt-get install ffmpeg mkvtoolnix opus-tools mediainfo
 ```
 
-#### Linux (Arch Linux)
+Install `sox_ng` from your distro/package source if unavailable in the default repo.
+
+## Usage (Primary)
+
+Run from a folder containing your `.mkv` files:
+
 ```bash
-sudo pacman -Syu ffmpeg mkvtoolnix-cli sox opus-tools mediainfo
+python MkvOpusEnc.py
 ```
-*(Note: on Arch, the package is `mkvtoolnix-cli`)*
 
-## Usage
+With downmix enabled:
 
-The script is run from the command line, providing an input file, an output file, and an optional switch to control downmixing.
+```bash
+python MkvOpusEnc.py --downmix
+```
+
+### Python CLI
+
+- `--downmix`: downmixes 6+ channel tracks to stereo before Opus encoding.
+
+## Output Layout
+
+When at least one input file is found, the script creates:
+
+- `completed/` for processed MKV files
+- `original/` for original source files
+- `conv_logs/` for per-file logs
+
+## Legacy PowerShell Usage
+
+Use [MkvOpusEnc.ps1](MkvOpusEnc.ps1) only when Python is unavailable:
 
 ```powershell
-./MkvOpusEnc.ps1 -InputFile <path> -OutputFile <path> [-Downmix]
+./MkvOpusEnc.ps1
+./MkvOpusEnc.ps1 -Downmix
 ```
 
-### Parameters
-
-* `-InputFile <string>`
-    * **(Required)** The full path to the source MKV file.
-* `-OutputFile <string>`
-    * **(Required)** The full path for the processed output MKV file.
-* `-Downmix`
-    * **(Optional Switch)** If this flag is present, any 5.1 or 7.1 audio tracks that are being re-encoded will be downmixed to stereo. If omitted, their original channel layout will be preserved.
-
-### Examples
-
-#### Example 1: Standard Mode (Preserving Channels)
-
-This command will re-encode a 5.1 DTS track into a 5.1 Opus track.
-
-```powershell
-./MkvOpusEnc.ps1 -InputFile "C:\Movies\MyMovie.mkv" -OutputFile "C:\Movies\MyMovie-Opus.mkv"
-```
-
-#### Example 2: Downmix Mode (Creating Stereo)
-
-This command will re-encode a 5.1 DTS track into a **stereo** Opus track using the "dialogue boost" formula.
-
-```powershell
-./MkvOpusEnc.ps1 -InputFile "C:\Movies\MyMovie.mkv" -OutputFile "C:\Movies\MyMovie-Stereo.mkv" -Downmix
-```
-
-#### Example 3: Batch Mode
-
-This command will re-encode multiple files to Opus.
-
-```powershell
-foreach ($file in gci *.mkv ) {$new = $file.BaseName + "_opus" + $file.Extension ; MkvOpusEnc.ps1 -InputFile $file -OutputFile $new }
-```
+The PowerShell version follows the same batch behavior as the Python script.
