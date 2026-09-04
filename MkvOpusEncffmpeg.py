@@ -8,9 +8,9 @@ This script intelligently handles audio streams in an MKV file one by one.
 - Multi-channel audio (DTS, AC3, etc.) can be re-encoded or optionally downmixed to stereo.
 - All other streams and metadata (title, language, delay) are preserved.
 
-Audio normalization uses ffmpeg loudnorm (two-pass constant-gain, no dynamic compression),
-matching the xav_automation.py philosophy: measure integrated LUFS, apply one linear gain,
-brickwall-clamp true peak via asoftclip. No sox_ng required.
+Audio normalization uses ffmpeg loudnorm two-pass linear (constant gain, true-peak aware).
+Downmix is Nightmode Dialogue (Collier / Harrelson) with pan '<' so the mix cannot clip.
+No asoftclip, no sox_ng.
 """
 
 import argparse
@@ -28,7 +28,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 LOUDNESS_I  = -16.0   # Target integrated loudness (LUFS)
 LOUDNESS_TP = -1.5    # True-peak ceiling (dBTP)
-# No LRA target — constant-gain only, no dynamic compression
+# loudnorm max. If target LRA < measured LRA, it silently switches to dynamic (compresses).
+LOUDNESS_LRA = 20.0
 
 
 class Tee:
@@ -95,22 +96,19 @@ def _finite_float(value, fallback):
 
 
 def apply_constant_gain_loudness(input_path, output_path, norm_i, norm_tp):
-    """
-    Measure integrated LUFS, apply one linear gain, brickwall-clamp true peak.
-    Constant-gain only — no LRA / dynamic range compression.
-
-    Pass 1: ffmpeg loudnorm in analysis-only mode measures input_i (integrated LUFS).
-    Pass 2: volume= applies the gain, asoftclip=type=hard clamps true peaks,
-            output is written as 32-bit signed FLAC.
-
-    Falls back to a plain FLAC copy if measurement fails.
-    """
-    # --- Pass 1: Measure integrated loudness ---
-    print(f"   [Norm] Pass 1 — measuring integrated loudness...")
+    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip."""
+    print(f"   [Norm] Pass 1 — measuring integrated loudness and true peak...")
+    print(
+        f"   [Norm] Targets: I={norm_i} LUFS, TP={norm_tp} dBTP, "
+        f"LRA={LOUDNESS_LRA} LU (linear; not a compressor)"
+    )
     result = subprocess.run(
         [
-            "ffmpeg", "-v", "info", "-i", str(input_path),
-            "-af", f"loudnorm=I={norm_i}:LRA=20:tp={norm_tp}:print_format=json",
+            "ffmpeg", "-hide_banner", "-v", "info", "-i", str(input_path),
+            "-af", (
+                f"loudnorm=I={norm_i}:LRA={LOUDNESS_LRA}:tp={norm_tp}"
+                f":print_format=json"
+            ),
             "-f", "null", "-",
         ],
         capture_output=True, text=True, encoding="utf-8", check=True,
@@ -124,27 +122,39 @@ def apply_constant_gain_loudness(input_path, output_path, norm_i, norm_tp):
         measured_i = None
 
     if measured_i is None:
-        # Fallback: copy without gain if measurement fails
         print(f"   [Norm] Fallback — copying without gain adjustment.")
         run_cmd(["ffmpeg", "-v", "quiet", "-y", "-i", str(input_path), "-c:a", "flac", str(output_path)])
         return
 
-    # --- Compute gain ---
-    gain_db   = norm_i - measured_i           # e.g. -16.0 - (-20.0) = +4.0 dB
-    gain      = 10 ** (gain_db / 20.0)        # linear gain factor
-    tp_linear = 10 ** (norm_tp / 20.0)        # brickwall ceiling in linear scale
-    print(f"   [Norm] Measured: {measured_i:.2f} LUFS  |  Gain: {gain_db:+.2f} dB  |  TP ceiling: {norm_tp} dBTP")
-
-    # --- Pass 2: Apply gain + brickwall true-peak clamp ---
-    print(f"   [Norm] Pass 2 — applying gain and true-peak clamp...")
+    measured_tp = _finite_float(stats.get("input_tp"), -99.0)
+    measured_lra = _finite_float(stats.get("input_lra"), 0.0)
+    measured_thresh = _finite_float(stats.get("input_thresh"), -70.0)
+    offset = _finite_float(stats.get("target_offset"), 0.0)
+    gain_db = norm_i - measured_i
+    print(
+        f"   [Norm] Measured I={measured_i:.2f} LUFS, TP={measured_tp:.2f} dBTP, "
+        f"LRA={measured_lra:.2f} LU → {gain_db:+.2f} dB (offset {offset:+.2f})"
+    )
+    if measured_lra > LOUDNESS_LRA:
+        print(
+            f"   [Norm] WARNING: source LRA {measured_lra:.2f} > {LOUDNESS_LRA}; "
+            "loudnorm may use dynamic mode."
+        )
+    print(f"   [Norm] Pass 2 — loudnorm linear=true (true-peak aware, not hard clip)...")
+    loudnorm_apply = (
+        f"loudnorm=I={norm_i}:LRA={LOUDNESS_LRA}:tp={norm_tp}"
+        f":measured_I={measured_i:.2f}"
+        f":measured_LRA={measured_lra:.2f}"
+        f":measured_TP={measured_tp:.2f}"
+        f":measured_thresh={measured_thresh:.2f}"
+        f":offset={offset:.2f}"
+        f":linear=true"
+        f":print_format=summary"
+    )
     run_cmd([
         "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
         "-i", str(input_path),
-        "-af", (
-            f"volume={gain:.10f},"
-            f"asoftclip=type=hard:threshold={tp_linear:.10f},"
-            f"aformat=sample_fmts=s32"
-        ),
+        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32",
         "-c:a", "flac", "-sample_fmt", "s32",
         str(output_path),
     ])
@@ -154,44 +164,74 @@ def apply_constant_gain_loudness(input_path, output_path, norm_i, norm_tp):
 # Audio track conversion
 # ---------------------------------------------------------------------------
 
+def downmix_filters(ch):
+    """Nightmode Dialogue (Collier / Harrelson). pan '<' renormalizes so the mix cannot clip."""
+    if ch == 6:
+        return [
+            "pan=stereo|FL<FC+0.30*FL+0.30*SL|FR<FC+0.30*FR+0.30*SR",
+            "pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR",
+            "aformat=ch_layouts=5.1,pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR",
+            "pan=stereo|c0<c2+0.30*c0+0.30*c4|c1<c2+0.30*c1+0.30*c5",
+        ]
+    if ch == 8:
+        return [
+            "pan=stereo|FL<FC+0.30*FL+0.30*SL+0.30*BL|FR<FC+0.30*FR+0.30*SR+0.30*BR",
+            "pan=stereo|c0<c2+0.30*c0+0.30*c4+0.30*c6|c1<c2+0.30*c1+0.30*c5+0.30*c7",
+        ]
+    return []
+
+
 def convert_audio_track(stream_index, channels, temp_dir, source_file,
                         should_downmix, bitrate_info, norm_i, norm_tp):
-    """Extracts, normalizes, and encodes a single audio track to Opus."""
+    """Extracts, Nightmode-downmixes if requested, loudnorm-linear, encodes Opus."""
     temp_extracted  = temp_dir / f"track_{stream_index}_extracted.flac"
     temp_normalized = temp_dir / f"track_{stream_index}_normalized.flac"
     final_opus      = temp_dir / f"track_{stream_index}_final.opus"
 
-    # --- Step 1: Extract audio, with conditional downmixing ---
     print(" - Extracting to FLAC...")
-    ffmpeg_args = [
-        "ffmpeg", "-v", "quiet", "-stats", "-y",
+    base_args = [
+        "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
+        "-drc_scale", "0",
         "-i", str(source_file),
         "-map", f"0:{stream_index}",
+        "-map_metadata", "-1",
     ]
 
     final_channels = channels
+    attempts = []
     if should_downmix and channels >= 6:
-        if channels == 6:   # 5.1
-            print(" (Downmixing 5.1 to Stereo with dialogue boost)")
-            ffmpeg_args.extend(["-af", "pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5"])
-            final_channels = 2
-        elif channels == 8:  # 7.1
-            print(" (Downmixing 7.1 to Stereo with dialogue boost)")
-            ffmpeg_args.extend(["-af", "pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7"])
-            final_channels = 2
-        else:
-            print(f" ({channels}-channel source, downmixing to stereo using -ac 2)")
-            ffmpeg_args.extend(["-ac", "2"])
-            final_channels = 2
+        attempts.extend(downmix_filters(channels))
+        attempts.append(None)
+        final_channels = 2
+        print(f" (Nightmode Dialogue downmix {channels}ch → stereo, pan '<')")
     else:
+        attempts.append("keep")
         print(f" (Preserving {channels}-channel layout)")
 
-    # Output codec + path are common to all branches (fixes missing output in downmix paths)
-    ffmpeg_args.extend(["-c:a", "flac", str(temp_extracted)])
-    run_cmd(ffmpeg_args)
+    last_error = None
+    extracted = False
+    for n, filt in enumerate(attempts, start=1):
+        ffmpeg_args = list(base_args)
+        if filt == "keep":
+            pass
+        elif filt is None:
+            ffmpeg_args += ["-ac", "2"]
+            print("   - Downmix fallback: -ac 2")
+        else:
+            ffmpeg_args += ["-af", filt]
+            print(f"   - Downmix filter (try {n}): {filt}")
+        ffmpeg_args += ["-c:a", "flac", str(temp_extracted)]
+        try:
+            run_cmd(ffmpeg_args)
+            extracted = True
+            break
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            print(f"   - Downmix try {n} failed, trying next option...")
+    if not extracted:
+        raise last_error
 
-    # --- Step 2: Normalize with ffmpeg loudnorm (constant-gain, no LRA) ---
-    print(" - Normalizing with ffmpeg (constant-gain LUFS normalization)...")
+    print(" - Normalizing with ffmpeg loudnorm 2-pass linear...")
     apply_constant_gain_loudness(temp_extracted, temp_normalized, norm_i, norm_tp)
 
     # --- Step 3: Encode to Opus with the correct bitrate ---
@@ -222,7 +262,7 @@ def main():
     )
     parser.add_argument(
         "--downmix", action="store_true",
-        help="If present, multi-channel audio will be downmixed to stereo.",
+        help="Nightmode Dialogue downmix of 5.1/7.1 to stereo (pan '<', no mix clip).",
     )
     parser.add_argument(
         "--norm-i", type=float, default=LOUDNESS_I,
