@@ -26,7 +26,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Loudness normalization constants (can be overridden via --norm-i / --norm-tp)
 # ---------------------------------------------------------------------------
-LOUDNESS_I  = -16.0   # Target integrated loudness (LUFS)
+LOUDNESS_I  = -18.0   # Target integrated loudness (LUFS)
 LOUDNESS_TP = -1.5    # True-peak ceiling (dBTP)
 # loudnorm max. If target LRA < measured LRA, it silently switches to dynamic (compresses).
 LOUDNESS_LRA = 20.0
