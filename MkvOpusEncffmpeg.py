@@ -95,13 +95,36 @@ def _finite_float(value, fallback):
     return number if math.isfinite(number) else fallback
 
 
-def apply_constant_gain_loudness(input_path, output_path, norm_i, norm_tp):
-    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip."""
+def stream_sample_rate(source_file, stream_index):
+    """Source track sample rate in Hz. loudnorm leaks 192 kHz; we restore this for opusenc's header."""
+    try:
+        raw = run_cmd(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", str(source_file)],
+            capture_output=True,
+        )
+        for stream in json.loads(raw).get("streams", []):
+            if int(stream.get("index", -1)) != int(stream_index):
+                continue
+            rate = int(str(stream.get("sample_rate") or "0").split()[0])
+            if rate > 0:
+                return rate
+    except (TypeError, ValueError, subprocess.CalledProcessError, json.JSONDecodeError):
+        pass
+    return 48000
+
+
+def apply_constant_gain_loudness(input_path, output_path, norm_i, norm_tp, sample_rate=48000):
+    """Two-pass ffmpeg loudnorm, linear (constant gain + true-peak). No asoftclip.
+
+    loudnorm true-peak uses 4× oversampling (48 kHz → 192 kHz). Pin the FLAC back
+    to the source rate so opusenc tags Input Sample Rate correctly (still encodes at 48 kHz).
+    """
     print(f"   [Norm] Pass 1 — measuring integrated loudness and true peak...")
     print(
         f"   [Norm] Targets: I={norm_i} LUFS, TP={norm_tp} dBTP, "
         f"LRA={LOUDNESS_LRA} LU (linear; not a compressor)"
     )
+    print(f"   [Norm] Restore sample rate after loudnorm: {sample_rate} Hz (source; Opus encode stays 48 kHz)")
     result = subprocess.run(
         [
             "ffmpeg", "-hide_banner", "-v", "info", "-i", str(input_path),
@@ -154,7 +177,8 @@ def apply_constant_gain_loudness(input_path, output_path, norm_i, norm_tp):
     run_cmd([
         "ffmpeg", "-hide_banner", "-v", "error", "-stats", "-y",
         "-i", str(input_path),
-        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32",
+        "-af", f"{loudnorm_apply},aformat=sample_fmts=s32:sample_rates={sample_rate}",
+        "-ar", str(sample_rate),
         "-c:a", "flac", "-sample_fmt", "s32",
         str(output_path),
     ])
@@ -232,7 +256,13 @@ def convert_audio_track(stream_index, channels, temp_dir, source_file,
         raise last_error
 
     print(" - Normalizing with ffmpeg loudnorm 2-pass linear...")
-    apply_constant_gain_loudness(temp_extracted, temp_normalized, norm_i, norm_tp)
+    apply_constant_gain_loudness(
+        temp_extracted,
+        temp_normalized,
+        norm_i,
+        norm_tp,
+        sample_rate=stream_sample_rate(source_file, stream_index),
+    )
 
     # --- Step 3: Encode to Opus with the correct bitrate ---
     bitrate = "192k"  # Fallback
