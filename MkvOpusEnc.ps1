@@ -6,27 +6,75 @@
     Mirrors the behavior of MkvOpusEnc.py:
     - Scans for *.mkv files (excluding temp-output-*).
     - AAC/Opus tracks are remuxed unchanged.
-    - All other audio codecs are extracted, normalized, and encoded to Opus.
-    - Optional downmix for 5.1/7.1 and other 6+ channel layouts.
+    - All other audio codecs are extracted, Nightmode-downmixed if requested,
+      loudness-normalized with ffmpeg loudnorm (two-pass linear), and encoded to Opus.
+    - Optional Nightmode Dialogue downmix for 5.1/7.1 and other 6+ channel layouts.
     - Preserves language, title, and delay metadata for re-encoded tracks.
     - Writes per-file logs to conv_logs, moves processed files to completed, originals to original.
+
+    Audio normalization uses ffmpeg loudnorm two-pass linear (constant gain, true-peak aware).
+    Downmix is Nightmode Dialogue (Collier / Harrelson) with pan '<' so the mix cannot clip.
+    No asoftclip, no sox_ng.
+
+.PARAMETER Downmix
+    Nightmode Dialogue downmix of 5.1/7.1 to stereo (pan '<', no mix clip).
+
+.PARAMETER NormI
+    Target integrated loudness in LUFS (default: -18.0).
+
+.PARAMETER NormTp
+    True-peak ceiling in dBTP (default: -1.5).
 #>
 
 [CmdletBinding()]
 param (
-    [switch]$Downmix
+    [switch]$Downmix,
+    [double]$NormI = -18.0,
+    [double]$NormTp = -1.5
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# loudnorm max. If target LRA < measured LRA, it silently switches to dynamic (compresses).
+$script:LoudnessLra = 20.0
+
 function Invoke-ExternalCommand {
     param (
         [Parameter(Mandatory = $true)][string]$Command,
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments,
         [switch]$CaptureOutput,
+        [switch]$CaptureStdErr,
         [switch]$NoCheck
     )
+
+    if ($CaptureStdErr) {
+        $resolved = (Get-Command $Command -ErrorAction Stop).Source
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $resolved
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        foreach ($arg in $Arguments) {
+            [void]$psi.ArgumentList.Add($arg)
+        }
+
+        $proc = [System.Diagnostics.Process]::new()
+        $proc.StartInfo = $psi
+        [void]$proc.Start()
+        $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        $proc.WaitForExit()
+        $stdout = $stdoutTask.GetAwaiter().GetResult()
+        $stderr = $stderrTask.GetAwaiter().GetResult()
+
+        if (-not $NoCheck -and $proc.ExitCode -ne 0) {
+            throw "Command failed (exit code $($proc.ExitCode)): $Command $($Arguments -join ' ')`n$stderr"
+        }
+
+        return $stderr
+    }
 
     if ($CaptureOutput) {
         $output = & $Command @Arguments
@@ -34,7 +82,8 @@ function Invoke-ExternalCommand {
         if (-not $NoCheck -and $exitCode -ne 0) {
             throw "Command failed (exit code $exitCode): $Command $($Arguments -join ' ')"
         }
-        return ($output -join [Environment]::NewLine)
+        # Wrap in @() so a single-line native result is not joined character-by-character.
+        return (@($output) -join [Environment]::NewLine)
     }
 
     & $Command @Arguments
@@ -47,13 +96,13 @@ function Invoke-ExternalCommand {
 }
 
 function Test-RequiredTools {
-    $requiredTools = @('ffmpeg', 'ffprobe', 'mkvmerge', 'sox_ng', 'opusenc', 'mediainfo')
+    $requiredTools = @('ffmpeg', 'ffprobe', 'mkvmerge', 'opusenc', 'mediainfo')
     Write-Host '--- Prerequisite Check ---'
 
     $allFound = $true
     foreach ($tool in $requiredTools) {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-            Write-Error "Required tool '$tool' not found."
+            Write-Host "Error: Required tool '$tool' not found." -ForegroundColor Red
             $allFound = $false
         }
     }
@@ -65,6 +114,224 @@ function Test-RequiredTools {
     Write-Host 'All required tools found.'
 }
 
+function Get-LoudnormJson {
+    param (
+        [Parameter(Mandatory = $true)][string]$StdErrOutput
+    )
+
+    $jsonStartIndex = $StdErrOutput.IndexOf('{')
+    if ($jsonStartIndex -lt 0) {
+        throw 'No JSON block found in ffmpeg stderr output.'
+    }
+
+    $braceLevel = 0
+    $jsonEndIndex = -1
+    for ($i = $jsonStartIndex; $i -lt $StdErrOutput.Length; $i++) {
+        $char = $StdErrOutput[$i]
+        if ($char -eq '{') {
+            $braceLevel++
+        }
+        elseif ($char -eq '}') {
+            $braceLevel--
+            if ($braceLevel -eq 0) {
+                $jsonEndIndex = $i + 1
+                break
+            }
+        }
+    }
+
+    if ($jsonEndIndex -lt 0) {
+        throw 'No JSON block found in ffmpeg stderr output.'
+    }
+
+    $jsonText = $StdErrOutput.Substring($jsonStartIndex, $jsonEndIndex - $jsonStartIndex)
+    return ($jsonText | ConvertFrom-Json -AsHashtable)
+}
+
+function Get-FiniteFloat {
+    param (
+        $Value,
+        $Fallback
+    )
+
+    if ($null -eq $Value) {
+        return $Fallback
+    }
+
+    $parsed = 0.0
+    if (-not [double]::TryParse(
+            [string]$Value,
+            [System.Globalization.NumberStyles]::Float,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsed
+        )) {
+        return $Fallback
+    }
+
+    if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {
+        return $Fallback
+    }
+
+    return $parsed
+}
+
+function Format-InvariantFixed {
+    param (
+        [double]$Value,
+        [int]$Decimals = 2
+    )
+
+    $format = '0.' + ('0' * $Decimals)
+    return $Value.ToString($format, [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Get-StreamSampleRate {
+    param (
+        [Parameter(Mandatory = $true)][string]$SourceFile,
+        [Parameter(Mandatory = $true)][int]$StreamIndex
+    )
+
+    try {
+        $raw = Invoke-ExternalCommand -Command 'ffprobe' -Arguments @(
+            '-v', 'quiet', '-print_format', 'json', '-show_streams', $SourceFile
+        ) -CaptureOutput
+        $info = $raw | ConvertFrom-Json -AsHashtable
+        foreach ($stream in @($info.streams)) {
+            if (-not $stream.ContainsKey('index')) {
+                continue
+            }
+            if ([int]$stream.index -ne $StreamIndex) {
+                continue
+            }
+
+            $rateText = ''
+            if ($stream.ContainsKey('sample_rate') -and $null -ne $stream.sample_rate) {
+                $rateText = [string]$stream.sample_rate
+            }
+            if ([string]::IsNullOrWhiteSpace($rateText)) {
+                break
+            }
+
+            $rate = 0
+            if ([int]::TryParse($rateText.Split()[0], [ref]$rate) -and $rate -gt 0) {
+                return $rate
+            }
+        }
+    }
+    catch {
+        # Fall through to default.
+    }
+
+    return 48000
+}
+
+function Invoke-ConstantGainLoudness {
+    param (
+        [Parameter(Mandatory = $true)][string]$InputPath,
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        [Parameter(Mandatory = $true)][double]$NormI,
+        [Parameter(Mandatory = $true)][double]$NormTp,
+        [int]$SampleRate = 48000
+    )
+
+    Write-Host '   [Norm] Pass 1 — measuring integrated loudness and true peak...'
+    Write-Host (
+        "   [Norm] Targets: I=$NormI LUFS, TP=$NormTp dBTP, " +
+        "LRA=$($script:LoudnessLra) LU (linear; not a compressor)"
+    )
+    Write-Host "   [Norm] Restore sample rate after loudnorm: $SampleRate Hz (source; Opus encode stays 48 kHz)"
+
+    $measureFilter = "loudnorm=I=${NormI}:LRA=$($script:LoudnessLra):tp=${NormTp}:print_format=json"
+    $stderr = Invoke-ExternalCommand -Command 'ffmpeg' -Arguments @(
+        '-hide_banner', '-v', 'info', '-i', $InputPath,
+        '-af', $measureFilter,
+        '-f', 'null', '-'
+    ) -CaptureStdErr
+
+    $stats = $null
+    $measuredI = $null
+    try {
+        $stats = Get-LoudnormJson -StdErrOutput $stderr
+        $measuredI = Get-FiniteFloat -Value $stats['input_i'] -Fallback $null
+    }
+    catch {
+        Write-Host "   [Norm] WARNING: Could not parse loudnorm JSON ($($_.Exception.Message)). Falling back to copy." -ForegroundColor Yellow
+        $measuredI = $null
+    }
+
+    if ($null -eq $measuredI) {
+        Write-Host '   [Norm] Fallback — copying without gain adjustment.'
+        Invoke-ExternalCommand -Command 'ffmpeg' -Arguments @(
+            '-v', 'quiet', '-y', '-i', $InputPath, '-c:a', 'flac', $OutputPath
+        ) | Out-Null
+        return
+    }
+
+    $measuredTp = Get-FiniteFloat -Value $stats['input_tp'] -Fallback -99.0
+    $measuredLra = Get-FiniteFloat -Value $stats['input_lra'] -Fallback 0.0
+    $measuredThresh = Get-FiniteFloat -Value $stats['input_thresh'] -Fallback -70.0
+    $offset = Get-FiniteFloat -Value $stats['target_offset'] -Fallback 0.0
+    $gainDb = $NormI - $measuredI
+
+    $gainText = $gainDb.ToString('+0.00;-0.00;+0.00', [System.Globalization.CultureInfo]::InvariantCulture)
+    $offsetText = $offset.ToString('+0.00;-0.00;+0.00', [System.Globalization.CultureInfo]::InvariantCulture)
+    Write-Host (
+        "   [Norm] Measured I=$(Format-InvariantFixed $measuredI) LUFS, " +
+        "TP=$(Format-InvariantFixed $measuredTp) dBTP, " +
+        "LRA=$(Format-InvariantFixed $measuredLra) LU → $gainText dB (offset $offsetText)"
+    )
+
+    if ($measuredLra -gt $script:LoudnessLra) {
+        Write-Host (
+            "   [Norm] WARNING: source LRA $(Format-InvariantFixed $measuredLra) > $($script:LoudnessLra); " +
+            'loudnorm may use dynamic mode.'
+        ) -ForegroundColor Yellow
+    }
+
+    Write-Host '   [Norm] Pass 2 — loudnorm linear=true (true-peak aware, not hard clip)...'
+    $loudnormApply = (
+        "loudnorm=I=${NormI}:LRA=$($script:LoudnessLra):tp=${NormTp}" +
+        ":measured_I=$(Format-InvariantFixed $measuredI)" +
+        ":measured_LRA=$(Format-InvariantFixed $measuredLra)" +
+        ":measured_TP=$(Format-InvariantFixed $measuredTp)" +
+        ":measured_thresh=$(Format-InvariantFixed $measuredThresh)" +
+        ":offset=$(Format-InvariantFixed $offset)" +
+        ':linear=true' +
+        ':print_format=summary'
+    )
+
+    Invoke-ExternalCommand -Command 'ffmpeg' -Arguments @(
+        '-hide_banner', '-v', 'error', '-stats', '-y',
+        '-i', $InputPath,
+        '-af', "$loudnormApply,aformat=sample_fmts=s32:sample_rates=$SampleRate",
+        '-ar', [string]$SampleRate,
+        '-c:a', 'flac', '-sample_fmt', 's32',
+        $OutputPath
+    ) | Out-Null
+}
+
+function Get-DownmixFilters {
+    param (
+        [Parameter(Mandatory = $true)][int]$Channels
+    )
+
+    if ($Channels -eq 6) {
+        return @(
+            'pan=stereo|FL<FC+0.30*FL+0.30*SL|FR<FC+0.30*FR+0.30*SR',
+            'pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR',
+            'aformat=ch_layouts=5.1,pan=stereo|FL<FC+0.30*FL+0.30*BL|FR<FC+0.30*FR+0.30*BR',
+            'pan=stereo|c0<c2+0.30*c0+0.30*c4|c1<c2+0.30*c1+0.30*c5'
+        )
+    }
+    if ($Channels -eq 8) {
+        return @(
+            'pan=stereo|FL<FC+0.30*FL+0.30*SL+0.30*BL|FR<FC+0.30*FR+0.30*SR+0.30*BR',
+            'pan=stereo|c0<c2+0.30*c0+0.30*c4+0.30*c6|c1<c2+0.30*c1+0.30*c5+0.30*c7'
+        )
+    }
+    return @()
+}
+
 function Convert-AudioTrack {
     param (
         [Parameter(Mandatory = $true)][int]$StreamIndex,
@@ -72,43 +339,92 @@ function Convert-AudioTrack {
         [Parameter(Mandatory = $true)][string]$TempDir,
         [Parameter(Mandatory = $true)][string]$SourceFile,
         [Parameter(Mandatory = $true)][bool]$ShouldDownmix,
-        [Parameter(Mandatory = $true)][string]$BitrateInfo
+        [Parameter(Mandatory = $true)][string]$BitrateInfo,
+        [Parameter(Mandatory = $true)][double]$NormI,
+        [Parameter(Mandatory = $true)][double]$NormTp
     )
 
     $tempExtracted = Join-Path $TempDir "track_${StreamIndex}_extracted.flac"
     $tempNormalized = Join-Path $TempDir "track_${StreamIndex}_normalized.flac"
     $finalOpus = Join-Path $TempDir "track_${StreamIndex}_final.opus"
 
-    Write-Host '    - Extracting to FLAC...'
-    $ffmpegArgs = @('-v', 'quiet', '-stats', '-y', '-i', $SourceFile, '-map', "0:$StreamIndex")
+    Write-Host ' - Extracting to FLAC...'
+    $baseArgs = @(
+        '-hide_banner', '-v', 'error', '-stats', '-y',
+        '-drc_scale', '0',
+        '-i', $SourceFile,
+        '-map', "0:$StreamIndex",
+        '-map_metadata', '-1'
+    )
 
     $finalChannels = $Channels
+    $attempts = [System.Collections.ArrayList]@()
     if ($ShouldDownmix -and $Channels -ge 6) {
-        if ($Channels -eq 6) {
-            Write-Host '      (Downmixing 5.1 to Stereo with dialogue boost)'
-            $ffmpegArgs += @('-af', 'pan=stereo|c0=c2+0.30*c0+0.30*c4|c1=c2+0.30*c1+0.30*c5')
-            $finalChannels = 2
+        foreach ($filt in (Get-DownmixFilters -Channels $Channels)) {
+            [void]$attempts.Add($filt)
         }
-        elseif ($Channels -eq 8) {
-            Write-Host '      (Downmixing 7.1 to Stereo with dialogue boost)'
-            $ffmpegArgs += @('-af', 'pan=stereo|c0=c2+0.30*c0+0.30*c4+0.30*c6|c1=c2+0.30*c1+0.30*c5+0.30*c7')
-            $finalChannels = 2
-        }
-        else {
-            Write-Host "      ($Channels-channel source, downmixing to stereo using default -ac 2)"
-            $ffmpegArgs += @('-ac', '2')
-            $finalChannels = 2
-        }
+        [void]$attempts.Add([string]::Empty)
+        $finalChannels = 2
+        Write-Host " (Nightmode Dialogue downmix ${Channels}ch → stereo, pan '<')"
     }
     else {
-        Write-Host "      (Preserving $Channels-channel layout)"
+        [void]$attempts.Add('keep')
+        Write-Host " (Preserving $Channels-channel layout)"
     }
 
-    $ffmpegArgs += @('-c:a', 'flac', $tempExtracted)
-    Invoke-ExternalCommand -Command 'ffmpeg' -Arguments $ffmpegArgs | Out-Null
+    $lastError = $null
+    $extracted = $false
+    $n = 0
+    foreach ($filt in $attempts) {
+        $n++
+        $ffmpegArgs = [System.Collections.Generic.List[string]]::new()
+        foreach ($arg in $baseArgs) {
+            $ffmpegArgs.Add($arg)
+        }
 
-    Write-Host '    - Normalizing with SoX...'
-    Invoke-ExternalCommand -Command 'sox_ng' -Arguments @($tempExtracted, $tempNormalized, '-S', '--temp', $TempDir, '--guard', 'gain', '-n') | Out-Null
+        if ($filt -eq 'keep') {
+            # Preserve channel layout.
+        }
+        elseif ([string]::IsNullOrEmpty($filt)) {
+            $ffmpegArgs.Add('-ac')
+            $ffmpegArgs.Add('2')
+            Write-Host '   - Downmix fallback: -ac 2'
+        }
+        else {
+            $ffmpegArgs.Add('-af')
+            $ffmpegArgs.Add($filt)
+            Write-Host "   - Downmix filter (try ${n}): $filt"
+        }
+
+        $ffmpegArgs.Add('-c:a')
+        $ffmpegArgs.Add('flac')
+        $ffmpegArgs.Add($tempExtracted)
+
+        try {
+            Invoke-ExternalCommand -Command 'ffmpeg' -Arguments $ffmpegArgs.ToArray() | Out-Null
+            $extracted = $true
+            break
+        }
+        catch {
+            $lastError = $_
+            Write-Host "   - Downmix try $n failed, trying next option..."
+        }
+    }
+
+    if (-not $extracted) {
+        if ($null -ne $lastError) {
+            throw $lastError
+        }
+        throw "Failed to extract audio stream $StreamIndex"
+    }
+
+    Write-Host ' - Normalizing with ffmpeg loudnorm 2-pass linear...'
+    Invoke-ConstantGainLoudness `
+        -InputPath $tempExtracted `
+        -OutputPath $tempNormalized `
+        -NormI $NormI `
+        -NormTp $NormTp `
+        -SampleRate (Get-StreamSampleRate -SourceFile $SourceFile -StreamIndex $StreamIndex)
 
     $bitrate = '192k'
     if ($finalChannels -eq 1) {
@@ -124,14 +440,16 @@ function Convert-AudioTrack {
         $bitrate = '384k'
     }
 
-    Write-Host "    - Encoding to Opus at $bitrate..."
-    Write-Host "      Source: $BitrateInfo -> Destination: Opus $bitrate ($finalChannels channels)"
-    Invoke-ExternalCommand -Command 'opusenc' -Arguments @('--vbr', '--bitrate', $bitrate, $tempNormalized, $finalOpus) | Out-Null
+    Write-Host " - Encoding to Opus at $bitrate..."
+    Write-Host " Source: $BitrateInfo -> Destination: Opus $bitrate ($finalChannels channels)"
+    Invoke-ExternalCommand -Command 'opusenc' -Arguments @(
+        '--vbr', '--bitrate', $bitrate, $tempNormalized, $finalOpus
+    ) | Out-Null
 
     return @{
-        Path = $finalOpus
-        FinalChannels = $finalChannels
-        Bitrate = $bitrate
+        Path           = $finalOpus
+        FinalChannels  = $finalChannels
+        Bitrate        = $bitrate
     }
 }
 
@@ -164,6 +482,7 @@ foreach ($file in $filesToProcess) {
         Write-Host ('-' * 80)
         Write-Host "Starting processing for: $($file.Name)"
         Write-Host "Log file: $logFilePath"
+        Write-Host "Normalization target: $NormI LUFS  |  True-peak ceiling: $NormTp dBTP"
         $startTime = Get-Date
 
         $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("mkvopusenc_{0}" -f ([System.Guid]::NewGuid().ToString('N')))
@@ -171,7 +490,9 @@ foreach ($file in $filesToProcess) {
         Write-Host "Temporary directory for audio created at: $tempDir"
 
         Write-Host "Analyzing file: $($file.FullName)"
-        $ffprobeInfoJson = Invoke-ExternalCommand -Command 'ffprobe' -Arguments @('-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', $file.FullName) -CaptureOutput
+        $ffprobeInfoJson = Invoke-ExternalCommand -Command 'ffprobe' -Arguments @(
+            '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', $file.FullName
+        ) -CaptureOutput
         $ffprobeInfo = $ffprobeInfoJson | ConvertFrom-Json -AsHashtable
 
         $mkvmergeInfoJson = Invoke-ExternalCommand -Command 'mkvmerge' -Arguments @('-J', $file.FullName) -CaptureOutput
@@ -185,7 +506,7 @@ foreach ($file in $filesToProcess) {
 
         $audioStreams = @($ffprobeInfo.streams | Where-Object { $_.codec_type -eq 'audio' })
         if ($audioStreams.Count -eq 0) {
-            Write-Warning "No audio streams found in '$($file.Name)'. Skipping file."
+            Write-Host "Warning: No audio streams found in '$($file.Name)'. Skipping file."
             continue
         }
 
@@ -235,7 +556,7 @@ foreach ($file in $filesToProcess) {
             }
 
             if ($trackId -eq -1) {
-                Write-Warning "Could not map ffprobe audio stream index $streamIndex to an mkvmerge track ID. Skipping this track."
+                Write-Host " -> Warning: Could not map ffprobe audio stream index $streamIndex to an mkvmerge track ID. Skipping this track."
                 continue
             }
 
@@ -252,16 +573,13 @@ foreach ($file in $filesToProcess) {
 
             $bitrate = 'Unknown'
             if ($null -ne $audioTrackInfo) {
-                if ($audioTrackInfo.ContainsKey('BitRate')) {
-                    $brValue = 0
-                    if ([int]::TryParse([string]$audioTrackInfo.BitRate, [ref]$brValue)) {
-                        $bitrate = "{0}k" -f [int]($brValue / 1000)
-                    }
-                }
-                elseif ($audioTrackInfo.ContainsKey('BitRate_Nominal')) {
-                    $brValue = 0
-                    if ([int]::TryParse([string]$audioTrackInfo.BitRate_Nominal, [ref]$brValue)) {
-                        $bitrate = "{0}k" -f [int]($brValue / 1000)
+                foreach ($key in @('BitRate', 'BitRate_Nominal')) {
+                    if ($audioTrackInfo.ContainsKey($key)) {
+                        $brValue = 0
+                        if ([int]::TryParse([string]$audioTrackInfo[$key], [ref]$brValue)) {
+                            $bitrate = "{0}k" -f [int][math]::Floor($brValue / 1000)
+                            break
+                        }
                     }
                 }
 
@@ -269,8 +587,13 @@ foreach ($file in $filesToProcess) {
                     $delayRaw = $audioTrackInfo.Video_Delay
                     if ($null -ne $delayRaw) {
                         $delayVal = 0.0
-                        if ([double]::TryParse([string]$delayRaw, [ref]$delayVal)) {
-                            if ($delayVal -lt 1 -and $delayVal -gt -1) {
+                        if ([double]::TryParse(
+                                [string]$delayRaw,
+                                [System.Globalization.NumberStyles]::Float,
+                                [System.Globalization.CultureInfo]::InvariantCulture,
+                                [ref]$delayVal
+                            )) {
+                            if ([math]::Abs($delayVal) -lt 1) {
                                 $trackDelay = [int][math]::Round($delayVal * 1000)
                             }
                             else {
@@ -295,18 +618,26 @@ foreach ($file in $filesToProcess) {
             Write-Host "`nProcessing $trackInfo"
 
             if ($codec -in @('aac', 'opus')) {
-                Write-Host "  -> Action: Remuxing track (keeping original $($codec.ToUpperInvariant()) $bitrate)"
+                Write-Host " -> Action: Remuxing track (keeping original $($codec.ToUpperInvariant()) $bitrate)"
             }
             else {
                 $bitrateInfo = "$($codec.ToUpperInvariant()) $bitrate"
-                Write-Host "  -> Action: Re-encoding codec '$codec' to Opus"
-                $converted = Convert-AudioTrack -StreamIndex $streamIndex -Channels $channels -TempDir $tempDir -SourceFile $file.FullName -ShouldDownmix $Downmix.IsPresent -BitrateInfo $bitrateInfo
+                Write-Host " -> Action: Re-encoding codec '$codec' to Opus"
+                $converted = Convert-AudioTrack `
+                    -StreamIndex $streamIndex `
+                    -Channels $channels `
+                    -TempDir $tempDir `
+                    -SourceFile $file.FullName `
+                    -ShouldDownmix $Downmix.IsPresent `
+                    -BitrateInfo $bitrateInfo `
+                    -NormI $NormI `
+                    -NormTp $NormTp
 
                 $null = $processedAudioFiles.Add(@{
-                    Path = $converted.Path
+                    Path     = $converted.Path
                     Language = $language
-                    Title = $trackTitle
-                    Delay = $trackDelay
+                    Title    = $trackTitle
+                    Delay    = $trackDelay
                 })
                 $null = $tidsOfReencodedTracks.Add([string]$trackId)
             }
@@ -317,7 +648,7 @@ foreach ($file in $filesToProcess) {
         $mkvmergeArgs = @('-o', $intermediateOutputFile)
 
         if ($processedAudioFiles.Count -eq 0) {
-            Write-Host '  -> All audio tracks are in the desired format. Performing a full remux.'
+            Write-Host ' -> All audio tracks are in the desired format. Performing a full remux.'
             $mkvmergeArgs += $file.FullName
         }
         else {
@@ -356,7 +687,7 @@ foreach ($file in $filesToProcess) {
         Write-Host "`nTotal processing time: $runtimeStr"
     }
     catch {
-        Write-Error "An error occurred while processing '$($file.Name)': $($_.Exception.Message)"
+        Write-Host "`nAn error occurred while processing '$($file.Name)': $($_.Exception.Message)" -ForegroundColor Red
         if (Test-Path -LiteralPath $intermediateOutputFile) {
             Remove-Item -LiteralPath $intermediateOutputFile -Force -ErrorAction SilentlyContinue
         }
